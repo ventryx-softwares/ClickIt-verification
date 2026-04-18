@@ -4,40 +4,56 @@ const { createClient } = require('@supabase/supabase-js');
 const crypto = require('crypto');
 
 // ── CONFIG ──────────────────────────────────────────────────────────────────
-const BOT_TOKEN      = process.env.BOT_TOKEN;
-const CHANNEL_ID     = '1234567890123456789'; // ← hard-code your channel ID here
-const VERIFIED_ROLE  = process.env.VERIFIED_ROLE_ID;
-const GUILD_ID       = process.env.GUILD_ID;
-const RENDER_URL     = process.env.RENDER_URL;
-const PORT           = process.env.PORT || 3000;
+const BOT_TOKEN        = process.env.BOT_TOKEN;
+const CHANNEL_ID       = '1234567890123456789'; // ← your channel ID here
+const VERIFIED_ROLE    = process.env.VERIFIED_ROLE_ID;
+const GUILD_ID         = process.env.GUILD_ID;
+const RENDER_URL       = process.env.RENDER_URL;       // e.g. https://clickit.onrender.com
+const CLIENT_ID        = process.env.DISCORD_CLIENT_ID;
+const CLIENT_SECRET    = process.env.DISCORD_CLIENT_SECRET;
+const PORT             = process.env.PORT || 3000;
+const REDIRECT_URI     = `${RENDER_URL}/callback`;
 // ────────────────────────────────────────────────────────────────────────────
 
 // ── SUPABASE ──────────────────────────────────────────────────────────────────
 const supabase = createClient(
   process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_KEY // service role key — bypasses RLS
+  process.env.SUPABASE_SERVICE_KEY
 );
 // ────────────────────────────────────────────────────────────────────────────
 
-// ── DISCORD CLIENT ────────────────────────────────────────────────────────────
+// ── DISCORD BOT ───────────────────────────────────────────────────────────────
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers]
 });
 
 client.once('ready', async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
-  await sendVerificationEmbed();
+  await ensureVerificationEmbed();
 });
 
-async function sendVerificationEmbed() {
+async function ensureVerificationEmbed() {
   const channel = await client.channels.fetch(CHANNEL_ID).catch(() => null);
   if (!channel) return console.error('❌ Channel not found. Check CHANNEL_ID.');
+
+  // Check if we already sent an embed — avoid duplicates on restart
+  const messages = await channel.messages.fetch({ limit: 20 });
+  const existing = messages.find(m =>
+    m.author.id === client.user.id &&
+    m.embeds.length > 0 &&
+    m.embeds[0].title === '🔒 Verify to Access the Server'
+  );
+
+  if (existing) {
+    console.log('📨 Verification embed already exists, skipping send.');
+    return;
+  }
 
   const embed = new EmbedBuilder()
     .setTitle('🔒 Verify to Access the Server')
     .setDescription(
       'To gain access and start your **free trial**, you must verify your account.\n\n' +
-      '> Click the button below to complete verification.\n\n' +
+      '> Click the button below and log in with Discord to complete verification.\n\n' +
       '⚠️ **One account per IP address.** Alt accounts are automatically detected and banned.'
     )
     .setColor(0x5865F2)
@@ -47,7 +63,7 @@ async function sendVerificationEmbed() {
   const row = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
       .setCustomId('start_verify')
-      .setLabel('✅  Verify Now')
+      .setLabel('🔐  Verify with Discord')
       .setStyle(ButtonStyle.Primary)
   );
 
@@ -71,44 +87,92 @@ client.on('interactionCreate', async (interaction) => {
     return interaction.editReply({ content: '✅ You are already verified!' });
   }
 
-  // Generate one-time token
-  const token = crypto.randomBytes(24).toString('hex');
-  await supabase.from('tokens').insert({
-    token,
+  // Generate a state token to track this user through the OAuth flow
+  const state = crypto.randomBytes(16).toString('hex');
+  await supabase.from('oauth_states').insert({
+    state,
     user_id: interaction.user.id,
     username: interaction.user.tag,
   });
 
-  const verifyUrl = `${RENDER_URL}/verify?token=${token}`;
+  // Build Discord OAuth2 URL
+  const params = new URLSearchParams({
+    client_id: CLIENT_ID,
+    redirect_uri: REDIRECT_URI,
+    response_type: 'code',
+    scope: 'identify',
+    state,
+  });
+
+  const oauthUrl = `https://discord.com/oauth2/authorize?${params}`;
 
   await interaction.editReply({
-    content: `**Click the link below to verify your account:**\n${verifyUrl}\n\n*This link is single-use and tied to your account.*`,
+    content: `**Click below to verify your account via Discord Login:**\n${oauthUrl}\n\n*This link is tied to your account and expires in 10 minutes.*`,
   });
 });
 // ────────────────────────────────────────────────────────────────────────────
 
-// ── EXPRESS SERVER ────────────────────────────────────────────────────────────
+// ── EXPRESS / OAUTH2 ──────────────────────────────────────────────────────────
 const app = express();
 app.set('trust proxy', true);
 
-app.get('/verify', async (req, res) => {
-  const { token } = req.query;
+// Discord redirects here after login
+app.get('/callback', async (req, res) => {
+  const { code, state } = req.query;
   const ip = req.ip || req.connection.remoteAddress;
 
-  if (!token) {
-    return res.status(400).send(renderPage('error', 'Missing verification token.'));
+  if (!code || !state) {
+    return res.status(400).send(renderPage('error', 'Missing OAuth parameters.'));
   }
 
-  // Validate token
-  const { data: tokenRow } = await supabase
-    .from('tokens')
+  // Validate state
+  const { data: stateRow } = await supabase
+    .from('oauth_states')
     .select('*')
-    .eq('token', token)
+    .eq('state', state)
     .eq('used', false)
     .maybeSingle();
 
-  if (!tokenRow) {
-    return res.status(400).send(renderPage('error', 'Invalid or already used token.'));
+  if (!stateRow) {
+    return res.status(400).send(renderPage('error', 'Invalid or expired verification link.'));
+  }
+
+  // Mark state used immediately to prevent replays
+  await supabase.from('oauth_states').update({ used: true }).eq('state', state);
+
+  // Exchange code for access token
+  let discordUser;
+  try {
+    const tokenRes = await fetch('https://discord.com/api/oauth2/token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        client_id: CLIENT_ID,
+        client_secret: CLIENT_SECRET,
+        grant_type: 'authorization_code',
+        code,
+        redirect_uri: REDIRECT_URI,
+      }),
+    });
+    const tokenData = await tokenRes.json();
+
+    if (!tokenData.access_token) throw new Error('No access token returned');
+
+    // Fetch the Discord user from the token
+    const userRes = await fetch('https://discord.com/api/users/@me', {
+      headers: { Authorization: `Bearer ${tokenData.access_token}` },
+    });
+    discordUser = await userRes.json();
+  } catch (err) {
+    console.error('OAuth error:', err.message);
+    return res.status(500).send(renderPage('error', 'Failed to authenticate with Discord. Please try again.'));
+  }
+
+  // Ensure the OAuth user matches the Discord user who clicked the button
+  if (discordUser.id !== stateRow.user_id) {
+    return res.status(403).send(renderPage('error',
+      `You must log in as <strong>${stateRow.username}</strong> — the account that clicked Verify.`
+    ));
   }
 
   // Alt check — same IP, different user?
@@ -116,40 +180,38 @@ app.get('/verify', async (req, res) => {
     .from('verified_ips')
     .select('*')
     .eq('ip', ip)
-    .neq('user_id', tokenRow.user_id);
+    .neq('user_id', discordUser.id);
 
   if (ipRows && ipRows.length > 0) {
-    console.warn(`🚨 Alt detected! IP ${ip} → tried as ${tokenRow.user_id}, already used by ${ipRows[0].user_id}`);
+    console.warn(`🚨 Alt detected! IP ${ip} → ${discordUser.username} already used by ${ipRows[0].username}`);
     return res.status(403).send(renderPage('banned',
-      `This IP address is already linked to another account (<strong>${ipRows[0].username}</strong>).<br>Alt accounts are not permitted.`
+      `This IP is already linked to another account (<strong>${ipRows[0].username}</strong>).<br>Alt accounts are not permitted.`
     ));
   }
 
-  // Mark token used
-  await supabase.from('tokens').update({ used: true }).eq('token', token);
-
-  // Log IP
+  // Log the verified IP
   await supabase.from('verified_ips').upsert({
     ip,
-    user_id: tokenRow.user_id,
-    username: tokenRow.username,
+    user_id: discordUser.id,
+    username: discordUser.username,
   });
 
-  console.log(`✅ Verified: ${tokenRow.username} (${tokenRow.user_id}) from IP ${ip}`);
+  console.log(`✅ Verified: ${discordUser.username} (${discordUser.id}) from IP ${ip}`);
 
   // Grant role
   try {
     const guild = await client.guilds.fetch(GUILD_ID);
-    const member = await guild.members.fetch(tokenRow.user_id);
+    const member = await guild.members.fetch(discordUser.id);
     await member.roles.add(VERIFIED_ROLE);
-    console.log(`🎭 Role granted to ${tokenRow.username}`);
+    console.log(`🎭 Role granted to ${discordUser.username}`);
   } catch (err) {
     console.error('⚠️ Failed to grant role:', err.message);
   }
 
-  res.send(renderPage('success', `You're verified, <strong>${tokenRow.username}</strong>! Head back to the server.`));
+  res.send(renderPage('success', `You're verified, <strong>${discordUser.username}</strong>! Head back to the server.`));
 });
 
+// Health check — keeps Render happy
 app.get('/', (_, res) => res.send('ClickIt Verification Bot is running.'));
 
 app.listen(PORT, () => console.log(`🌐 Web server on port ${PORT}`));
