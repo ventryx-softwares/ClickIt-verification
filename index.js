@@ -5,14 +5,15 @@ const crypto = require('crypto');
 
 // ── CONFIG ──────────────────────────────────────────────────────────────────
 const BOT_TOKEN        = process.env.BOT_TOKEN;
-const CHANNEL_ID       = '1234567890123456789'; // ← your channel ID here
+const CHANNEL_ID       = '1495042210427830426';
 const VERIFIED_ROLE    = process.env.VERIFIED_ROLE_ID;
+const UNVERIFIED_ROLE  = '1495086433583501353'; // ← role to remove on verify
 const GUILD_ID         = process.env.GUILD_ID;
 const RENDER_URL       = process.env.RENDER_URL;
 const CLIENT_ID        = process.env.DISCORD_CLIENT_ID;
 const CLIENT_SECRET    = process.env.DISCORD_CLIENT_SECRET;
 const PORT             = process.env.PORT || 3000;
-const REDIRECT_URI     = 'https://clickit-ver.ventryx.xyz/callback'; // ← hard-coded to avoid encoding issues
+const REDIRECT_URI     = 'https://clickit-ver.ventryx.xyz/callback';
 // ────────────────────────────────────────────────────────────────────────────
 
 // ── SUPABASE ──────────────────────────────────────────────────────────────────
@@ -92,7 +93,6 @@ client.on('interactionCreate', async (interaction) => {
     username: interaction.user.tag,
   });
 
-  // Build OAuth URL — redirect_uri must NOT go through URLSearchParams to avoid double-encoding
   const oauthUrl = `https://discord.com/oauth2/authorize?client_id=${CLIENT_ID}&redirect_uri=${encodeURIComponent(REDIRECT_URI)}&response_type=code&scope=identify&state=${state}`;
 
   await interaction.editReply({
@@ -179,13 +179,20 @@ app.get('/callback', async (req, res) => {
 
   console.log(`✅ Verified: ${discordUser.username} (${discordUser.id}) from IP ${ip}`);
 
+  // Grant verified role + remove unverified role
   try {
     const guild = await client.guilds.fetch(GUILD_ID);
     const member = await guild.members.fetch(discordUser.id);
+
     await member.roles.add(VERIFIED_ROLE);
-    console.log(`🎭 Role granted to ${discordUser.username}`);
+    console.log(`🎭 Verified role granted to ${discordUser.username}`);
+
+    if (member.roles.cache.has(UNVERIFIED_ROLE)) {
+      await member.roles.remove(UNVERIFIED_ROLE);
+      console.log(`🗑️ Unverified role removed from ${discordUser.username}`);
+    }
   } catch (err) {
-    console.error('⚠️ Failed to grant role:', err.message);
+    console.error('⚠️ Failed to update roles:', err.message);
   }
 
   res.send(renderPage('success', `You're verified, <strong>${discordUser.username}</strong>! Head back to the server.`));
