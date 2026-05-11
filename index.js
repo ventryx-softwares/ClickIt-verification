@@ -7,13 +7,13 @@ const path = require('path');
 
 const logsPath = path.join(__dirname, 'logs.json');
 function getLogs() {
-  if (!fs.existsSync(logsPath)) return { vpn: {}, alts: {} };
-  try { return JSON.parse(fs.readFileSync(logsPath, 'utf8')); } catch { return { vpn: {}, alts: {} }; }
+  if (!fs.existsSync(logsPath)) return { vpn: {}, proxy: {}, datacenter: {}, alts: {} };
+  try { return JSON.parse(fs.readFileSync(logsPath, 'utf8')); } catch { return { vpn: {}, proxy: {}, datacenter: {}, alts: {} }; }
 }
-function saveLog(type, userId) {
+function saveLog(type, key) {
   const logs = getLogs();
   if (!logs[type]) logs[type] = {};
-  logs[type][userId] = (logs[type][userId] || 0) + 1;
+  logs[type][key] = (logs[type][key] || 0) + 1;
   fs.writeFileSync(logsPath, JSON.stringify(logs, null, 2));
 }
 
@@ -27,6 +27,245 @@ const CLIENT_ID        = process.env.DISCORD_CLIENT_ID;
 const CLIENT_SECRET    = process.env.DISCORD_CLIENT_SECRET;
 const PORT             = process.env.PORT || 3000;
 const REDIRECT_URI     = 'https://clickit-ver.ventryx.xyz/callback';
+
+let iCloudRelayRanges = [];
+let iCloudRangesLastFetched = 0;
+
+function ipToLong(ip) {
+  return ip.split('.').reduce((acc, oct) => (acc << 8) + parseInt(oct, 10), 0) >>> 0;
+}
+
+function cidrContains(cidr, ip) {
+  const [base, bits] = cidr.split('/');
+  const mask = bits ? ~((1 << (32 - parseInt(bits))) - 1) >>> 0 : 0xFFFFFFFF;
+  return (ipToLong(base) & mask) === (ipToLong(ip) & mask);
+}
+
+function isIPv4(ip) {
+  return /^\d{1,3}(\.\d{1,3}){3}$/.test(ip);
+}
+
+function isICloudRelayIP(ip) {
+  if (!isIPv4(ip)) return false;
+  return iCloudRelayRanges.some(cidr => cidrContains(cidr, ip));
+}
+
+async function refreshICloudRanges() {
+  try {
+    const res = await fetchWithTimeout('https://mask-api.icloud.com/egress-ip-ranges.csv', {}, 8000);
+    const text = await res.text();
+    const ranges = text.split('\n')
+      .map(line => line.split(',')[0].trim())
+      .filter(r => r && r.includes('/'));
+    if (ranges.length > 0) {
+      iCloudRelayRanges = ranges;
+      iCloudRangesLastFetched = Date.now();
+      console.log(`[iCloud] Loaded ${ranges.length} egress IP ranges`);
+    }
+  } catch (err) {
+    console.error('[iCloud] Failed to fetch egress ranges:', err.message);
+  }
+}
+
+const DATACENTER_HOSTNAME_PATTERNS = [
+  /amazon/, /amazonaws/, /aws/, /digitalocean/, /linode/, /hetzner/,
+  /vultr/, /ovh/, /cloudflare/, /fastly/, /akamai/, /zscaler/,
+  /tor-exit/, /torexit/, /mullvad/, /nordvpn/, /expressvpn/,
+  /ipvanish/, /surfshark/, /privateinternetaccess/, /pia\./, /cyberghost/,
+  /hidemyass/, /protonvpn/, /windscribe/, /hotspotshield/,
+  /hosting/, /host\./, /server/, /vps/, /datacenter/, /data-center/,
+];
+
+const PROXY_HEADERS = [
+  'via', 'x-forwarded-for', 'forwarded-for', 'x-forwarded',
+  'forwarded', 'proxy-connection', 'x-proxy-id', 'mt-proxy-id',
+  'x-tinyproxy', 'x-bluecoat-via', 'x-cache', 'x-cache-lookup',
+  'x-squid-error', 'proxy-authenticate', 'x-real-ip',
+];
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = 5000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { ...options, signal: controller.signal });
+    return res;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function checkIPAPI(ip, isRelay) {
+  try {
+    const res = await fetchWithTimeout(
+      `http://ip-api.com/json/${ip}?fields=status,proxy,hosting,vpn,tor,query`
+    );
+    const data = await res.json();
+    if (data.status !== 'success') return null;
+    const blockHosting = data.hosting && !isRelay;
+    if (data.proxy || data.vpn || data.tor || blockHosting) {
+      return {
+        blocked: true,
+        source: 'ip-api',
+        detail: data.tor ? 'Tor exit node' : data.vpn ? 'VPN detected' : data.proxy ? 'Proxy detected' : 'Datacenter/hosting IP',
+        logType: data.hosting ? 'datacenter' : data.tor ? 'vpn' : 'proxy',
+      };
+    }
+    return { blocked: false };
+  } catch {
+    return null;
+  }
+}
+
+async function checkVpnApi(ip, isRelay) {
+  try {
+    const res = await fetchWithTimeout(
+      `https://vpnapi.io/api/${ip}`
+    );
+    const data = await res.json();
+    if (!data.security) return null;
+    const { vpn, proxy, tor, relay } = data.security;
+    const blockRelay = relay && !isRelay;
+    if (vpn || proxy || tor || blockRelay) {
+      return {
+        blocked: true,
+        source: 'vpnapi',
+        detail: tor ? 'Tor exit node' : vpn ? 'VPN detected' : proxy ? 'Proxy detected' : 'Apple/iCloud relay',
+        logType: tor || vpn ? 'vpn' : 'proxy',
+      };
+    }
+    return { blocked: false };
+  } catch {
+    return null;
+  }
+}
+
+async function checkBlackbox(ip) {
+  try {
+    const res = await fetchWithTimeout(`https://blackbox.ipinfo.app/lookup/${ip}`);
+    const text = await res.text();
+    if (text.trim() === 'Y') {
+      return {
+        blocked: true,
+        source: 'blackbox',
+        detail: 'VPN or anonymiser detected',
+        logType: 'vpn',
+      };
+    }
+    return { blocked: false };
+  } catch {
+    return null;
+  }
+}
+
+function checkProxyHeaders(headers) {
+  for (const header of PROXY_HEADERS) {
+    if (headers[header]) {
+      if (header === 'x-forwarded-for') {
+        const ips = headers[header].split(',').map(s => s.trim());
+        if (ips.length > 1) {
+          return {
+            blocked: true,
+            source: 'headers',
+            detail: 'Multiple forwarded IPs indicate proxy chain',
+            logType: 'proxy',
+          };
+        }
+        continue;
+      }
+      if (header === 'x-real-ip' && headers[header] !== headers['x-forwarded-for']) {
+        continue;
+      }
+      return {
+        blocked: true,
+        source: 'headers',
+        detail: `Proxy header detected: ${header}`,
+        logType: 'proxy',
+      };
+    }
+  }
+  return null;
+}
+
+async function checkReverseDNS(ip) {
+  try {
+    const { Resolver } = require('dns').promises;
+    const resolver = new Resolver();
+    resolver.setServers(['1.1.1.1', '8.8.8.8']);
+    const hostnames = await Promise.race([
+      resolver.reverse(ip),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), 3000)),
+    ]);
+    for (const hostname of hostnames) {
+      const lower = hostname.toLowerCase();
+      for (const pattern of DATACENTER_HOSTNAME_PATTERNS) {
+        if (pattern.test(lower)) {
+          return {
+            blocked: true,
+            source: 'rdns',
+            detail: `Datacenter/VPN hostname: ${hostname}`,
+            logType: 'datacenter',
+          };
+        }
+      }
+    }
+    return { blocked: false };
+  } catch {
+    return { blocked: false };
+  }
+}
+
+function isAppleUA(headers) {
+  const ua = (headers['user-agent'] || '').toLowerCase();
+  return (
+    (ua.includes('safari') && !ua.includes('chrome') && !ua.includes('android')) ||
+    ua.includes('iphone') ||
+    ua.includes('ipad') ||
+    ua.includes('ipod') ||
+    (ua.includes('macintosh') && ua.includes('applewebkit') && !ua.includes('chrome'))
+  );
+}
+
+async function checkIPThreat(ip, headers) {
+  if (Date.now() - iCloudRangesLastFetched > 24 * 60 * 60 * 1000) {
+    await refreshICloudRanges();
+  }
+
+  const isRelay = isICloudRelayIP(ip);
+  const isApple = isAppleUA(headers);
+  const skipDatacenterChecks = isRelay || isApple;
+
+  if (isRelay) console.log(`[iCloud] Relay IP: ${ip} — skipping datacenter/rDNS checks`);
+  if (isApple && !isRelay) console.log(`[Apple UA] Safari/iOS detected for ${ip} — skipping datacenter/rDNS checks`);
+
+  const headerCheck = skipDatacenterChecks ? null : checkProxyHeaders(headers);
+  if (headerCheck) return headerCheck;
+
+  const checks = [
+    checkIPAPI(ip, skipDatacenterChecks),
+    checkVpnApi(ip, skipDatacenterChecks),
+    checkBlackbox(ip),
+    skipDatacenterChecks ? Promise.resolve({ blocked: false }) : checkReverseDNS(ip),
+  ];
+
+  const [ipApi, vpnApi, blackbox, rdns] = await Promise.all(checks);
+
+  const results = [ipApi, vpnApi, blackbox, rdns].filter(Boolean);
+  const blocked = results.find(r => r.blocked);
+  if (blocked) return blocked;
+
+  const failedSources = results.length;
+  if (failedSources === 0) {
+    console.warn(`[SECURITY] All IP check APIs failed for ${ip} — blocking by default (fail-closed)`);
+    return {
+      blocked: true,
+      source: 'failsafe',
+      detail: 'Unable to verify your IP — all security checks failed. Try again.',
+      logType: 'vpn',
+    };
+  }
+
+  return { blocked: false };
+}
 
 const supabase = createClient(
   process.env.SUPABASE_URL,
@@ -42,7 +281,7 @@ async function registerCommands() {
     new SlashCommandBuilder()
       .setName('getip')
       .setDescription('Get IP and verification info for a user')
-      .addUserOption(option => 
+      .addUserOption(option =>
         option.setName('target')
           .setDescription('The user to check')
           .setRequired(true))
@@ -61,6 +300,7 @@ async function registerCommands() {
 
 client.once('ready', async () => {
   console.log(`Logged in as ${client.user.tag}`);
+  await refreshICloudRanges();
   await registerCommands();
   await ensureVerificationEmbed();
 });
@@ -106,7 +346,7 @@ async function ensureVerificationEmbed() {
 client.on('interactionCreate', async (interaction) => {
   if (interaction.isChatInputCommand() && interaction.commandName === 'getip') {
     const target = interaction.options.getUser('target');
-    
+
     const { data: verified } = await supabase
       .from('verified_ips')
       .select('*')
@@ -114,8 +354,10 @@ client.on('interactionCreate', async (interaction) => {
       .maybeSingle();
 
     const logs = getLogs();
-    const vpnAttempts = logs.vpn[target.id] || 0;
-    const altAttempts = logs.alts[target.id] || 0;
+    const vpnAttempts   = logs.vpn?.[target.id]        || 0;
+    const proxyAttempts = logs.proxy?.[target.id]      || 0;
+    const dcAttempts    = logs.datacenter?.[target.id] || 0;
+    const altAttempts   = logs.alts?.[target.id]       || 0;
 
     let reply = `**Info for ${target.tag} (${target.id})**\n`;
     if (verified) {
@@ -125,7 +367,7 @@ client.on('interactionCreate', async (interaction) => {
         .select('*')
         .eq('ip', verified.ip)
         .neq('user_id', target.id);
-      
+
       if (shared && shared.length > 0) {
         reply += `**Shared IPs:** This IP is also used by ${shared.map(s => s.username).join(', ')}\n`;
       }
@@ -134,6 +376,8 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     reply += `**VPN Attempts:** ${vpnAttempts}\n`;
+    reply += `**Proxy Attempts:** ${proxyAttempts}\n`;
+    reply += `**Datacenter Attempts:** ${dcAttempts}\n`;
     reply += `**Alt Attempts:** ${altAttempts}\n`;
 
     return interaction.reply({ content: reply, ephemeral: true });
@@ -179,17 +423,13 @@ app.get('/callback', async (req, res) => {
   }
 
   if (ip && ip !== '::1' && ip !== '127.0.0.1') {
-    try {
-      const vpnRes = await fetch(`https://blackbox.ipinfo.app/lookup/${ip}`);
-      const isVpn = await vpnRes.text();
-      if (isVpn.trim() === 'Y') {
-        console.warn(`VPN detected for IP ${ip}`);
-        return res.status(403).send(renderPage('vpn',
-          `You are using a VPN or Proxy (<strong>${ip}</strong>).<br>Please disable it and try again.`
-        ));
-      }
-    } catch (err) {
-      console.error('Failed to check VPN status:', err.message);
+    const threatResult = await checkIPThreat(ip, req.headers);
+    if (threatResult.blocked) {
+      console.warn(`[SECURITY] Blocked ${ip} — reason: ${threatResult.source} / ${threatResult.detail}`);
+      saveLog(threatResult.logType, ip);
+      return res.status(403).send(renderPage('vpn',
+        `Your connection was blocked.<br><strong>Reason:</strong> ${threatResult.detail}<br><br>Disable any VPN, proxy, or anonymiser and try again.`
+      ));
     }
   }
 
@@ -238,18 +478,26 @@ app.get('/callback', async (req, res) => {
     ));
   }
 
-  const { data: ipRows } = await supabase
-    .from('verified_ips')
-    .select('*')
-    .eq('ip', ip)
-    .neq('user_id', discordUser.id);
+  const isRelay = isICloudRelayIP(ip);
+  const isApple = isAppleUA(req.headers);
+  const skipAltIPCheck = isRelay || isApple;
 
-  if (ipRows && ipRows.length > 0) {
-    console.warn(`Alt detected! IP ${ip} - ${discordUser.username} already used by ${ipRows[0].username}`);
-    saveLog('alts', discordUser.id);
-    return res.status(403).send(renderPage('banned',
-      `This ip is already linked to another account (<strong>${ipRows[0].username}</strong>).<br>Alt accounts are not permitted.`
-    ));
+  if (!skipAltIPCheck) {
+    const { data: ipRows } = await supabase
+      .from('verified_ips')
+      .select('*')
+      .eq('ip', ip)
+      .neq('user_id', discordUser.id);
+
+    if (ipRows && ipRows.length > 0) {
+      console.warn(`Alt detected! IP ${ip} - ${discordUser.username} already used by ${ipRows[0].username}`);
+      saveLog('alts', discordUser.id);
+      return res.status(403).send(renderPage('banned',
+        `This ip is already linked to another account (<strong>${ipRows[0].username}</strong>).<br>Alt accounts are not permitted.`
+      ));
+    }
+  } else {
+    console.log(`[Apple/iCloud] Skipping alt-IP check for ${ip} (${discordUser.username}) — relay: ${isRelay}, apple UA: ${isApple}`);
   }
 
   await supabase.from('verified_ips').upsert({
@@ -286,10 +534,10 @@ client.login(BOT_TOKEN);
 
 function renderPage(type, message) {
   const configs = {
-    success: { title: 'Verified',    color: '#57F287', rgb: '87, 242, 135' },
+    success: { title: 'Verified',      color: '#57F287', rgb: '87, 242, 135' },
     error:   { title: 'Error',         color: '#ED4245', rgb: '237, 66, 69' },
-    banned:  { title: 'Alt Detected', color: '#FEE75C', rgb: '254, 231, 92' },
-    vpn:     { title: 'VPN Detected', color: '#ED4245', rgb: '237, 66, 69' },
+    banned:  { title: 'Alt Detected',  color: '#FEE75C', rgb: '254, 231, 92' },
+    vpn:     { title: 'Blocked',       color: '#ED4245', rgb: '237, 66, 69' },
   };
   const c = configs[type] || configs.error;
 
@@ -319,11 +567,10 @@ function renderPage(type, message) {
       -webkit-backdrop-filter: blur(10px);
       border-radius: 20px;
       border: 1px solid rgba(255, 255, 255, 0.15);
-      box-shadow: 
+      box-shadow:
         0 8px 32px rgba(0, 0, 0, 0.4),
         inset 0 1px 0 rgba(255, 255, 255, 0.15),
-        inset 0 -1px 0 rgba(255, 255, 255, 0.05),
-        inset 0 0 0px 0px rgba(255, 255, 255, 0);
+        inset 0 -1px 0 rgba(255, 255, 255, 0.05);
       position: relative;
       overflow: hidden;
       padding: 48px 40px;
@@ -336,31 +583,18 @@ function renderPage(type, message) {
     .card::before {
       content: '';
       position: absolute;
-      top: 0;
-      left: 0;
-      right: 0;
+      top: 0; left: 0; right: 0;
       height: 1px;
-      background: linear-gradient(
-        90deg,
-        transparent,
-        rgba(255, 255, 255, 0.5),
-        transparent
-      );
+      background: linear-gradient(90deg, transparent, rgba(255,255,255,0.5), transparent);
       z-index: 1;
     }
     .card::after {
       content: '';
       position: absolute;
-      top: 0;
-      left: 0;
+      top: 0; left: 0;
       width: 1px;
       height: 100%;
-      background: linear-gradient(
-        180deg,
-        rgba(255, 255, 255, 0.5),
-        transparent,
-        rgba(255, 255, 255, 0.1)
-      );
+      background: linear-gradient(180deg, rgba(255,255,255,0.5), transparent, rgba(255,255,255,0.1));
       z-index: 1;
     }
     .status-tint {
@@ -391,10 +625,7 @@ function renderPage(type, message) {
       font-size: 0.95rem;
       font-weight: 400;
     }
-    p strong {
-      color: #ededed;
-      font-weight: 600;
-    }
+    p strong { color: #ededed; font-weight: 600; }
     .badge {
       position: relative;
       z-index: 2;
@@ -402,7 +633,7 @@ function renderPage(type, message) {
       font-size: 0.7rem;
       color: #525252;
       letter-spacing: 0.06em;
-      border-top: 1px solid rgba(255, 255, 255, 0.06);
+      border-top: 1px solid rgba(255,255,255,0.06);
       padding-top: 20px;
     }
   </style>
