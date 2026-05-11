@@ -1,21 +1,9 @@
 const { Client, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, REST, Routes, SlashCommandBuilder, PermissionFlagsBits } = require('discord.js');
 const express = require('express');
-const { createClient } = require('@supabase/supabase-js');
+const { neon } = require('@neondatabase/serverless');
 const crypto = require('crypto');
-const fs = require('fs');
-const path = require('path');
 
-const logsPath = path.join(__dirname, 'logs.json');
-function getLogs() {
-  if (!fs.existsSync(logsPath)) return { vpn: {}, proxy: {}, datacenter: {}, alts: {} };
-  try { return JSON.parse(fs.readFileSync(logsPath, 'utf8')); } catch { return { vpn: {}, proxy: {}, datacenter: {}, alts: {} }; }
-}
-function saveLog(type, key) {
-  const logs = getLogs();
-  if (!logs[type]) logs[type] = {};
-  logs[type][key] = (logs[type][key] || 0) + 1;
-  fs.writeFileSync(logsPath, JSON.stringify(logs, null, 2));
-}
+const sql = neon(process.env.DATABASE_URL);
 
 const BOT_TOKEN        = process.env.BOT_TOKEN;
 const CHANNEL_ID       = '1495042210427830426';
@@ -267,10 +255,21 @@ async function checkIPThreat(ip, headers) {
   return { blocked: false };
 }
 
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_KEY
-);
+async function saveLog(type, key) {
+  await sql`
+    insert into logs (type, key, count, updated_at)
+    values (${type}, ${key}, 1, now())
+    on conflict (type, key)
+    do update set count = logs.count + 1, updated_at = now()
+  `;
+}
+
+async function getLogCount(type, key) {
+  const rows = await sql`
+    select count from logs where type = ${type} and key = ${key}
+  `;
+  return rows[0]?.count || 0;
+}
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers]
@@ -347,28 +346,21 @@ client.on('interactionCreate', async (interaction) => {
   if (interaction.isChatInputCommand() && interaction.commandName === 'getip') {
     const target = interaction.options.getUser('target');
 
-    const { data: verified } = await supabase
-      .from('verified_ips')
-      .select('*')
-      .eq('user_id', target.id)
-      .maybeSingle();
+    const verifiedRows = await sql`select * from verified_ips where user_id = ${target.id}`;
+    const verified = verifiedRows[0] || null;
 
-    const logs = getLogs();
-    const vpnAttempts   = logs.vpn?.[target.id]        || 0;
-    const proxyAttempts = logs.proxy?.[target.id]      || 0;
-    const dcAttempts    = logs.datacenter?.[target.id] || 0;
-    const altAttempts   = logs.alts?.[target.id]       || 0;
+    const [vpnAttempts, proxyAttempts, dcAttempts, altAttempts] = await Promise.all([
+      getLogCount('vpn', target.id),
+      getLogCount('proxy', target.id),
+      getLogCount('datacenter', target.id),
+      getLogCount('alts', target.id),
+    ]);
 
     let reply = `**Info for ${target.tag} (${target.id})**\n`;
     if (verified) {
       reply += `**IP:** ${verified.ip}\n`;
-      const { data: shared } = await supabase
-        .from('verified_ips')
-        .select('*')
-        .eq('ip', verified.ip)
-        .neq('user_id', target.id);
-
-      if (shared && shared.length > 0) {
+      const shared = await sql`select * from verified_ips where ip = ${verified.ip} and user_id != ${target.id}`;
+      if (shared.length > 0) {
         reply += `**Shared IPs:** This IP is also used by ${shared.map(s => s.username).join(', ')}\n`;
       }
     } else {
@@ -387,22 +379,13 @@ client.on('interactionCreate', async (interaction) => {
 
   await interaction.deferReply({ ephemeral: true });
 
-  const { data: existing } = await supabase
-    .from('verified_ips')
-    .select('user_id')
-    .eq('user_id', interaction.user.id)
-    .maybeSingle();
-
-  if (existing) {
+  const existingRows = await sql`select user_id from verified_ips where user_id = ${interaction.user.id}`;
+  if (existingRows.length > 0) {
     return interaction.editReply({ content: 'You are already verified!' });
   }
 
   const state = crypto.randomBytes(16).toString('hex');
-  await supabase.from('oauth_states').insert({
-    state,
-    user_id: interaction.user.id,
-    username: interaction.user.tag,
-  });
+  await sql`insert into oauth_states (state, user_id, username) values (${state}, ${interaction.user.id}, ${interaction.user.tag})`;
 
   const oauthUrl = `https://discord.com/oauth2/authorize?client_id=${CLIENT_ID}&redirect_uri=${encodeURIComponent(REDIRECT_URI)}&response_type=code&scope=identify&state=${state}`;
 
@@ -433,18 +416,14 @@ app.get('/callback', async (req, res) => {
     }
   }
 
-  const { data: stateRow } = await supabase
-    .from('oauth_states')
-    .select('*')
-    .eq('state', state)
-    .eq('used', false)
-    .maybeSingle();
+  const stateRows = await sql`select * from oauth_states where state = ${state} and used = false`;
+  const stateRow = stateRows[0] || null;
 
   if (!stateRow) {
     return res.status(400).send(renderPage('error', 'Invalid or expired verification link.'));
   }
 
-  await supabase.from('oauth_states').update({ used: true }).eq('state', state);
+  await sql`update oauth_states set used = true where state = ${state}`;
 
   let discordUser;
   try {
@@ -483,13 +462,8 @@ app.get('/callback', async (req, res) => {
   const skipAltIPCheck = isRelay || isApple;
 
   if (!skipAltIPCheck) {
-    const { data: ipRows } = await supabase
-      .from('verified_ips')
-      .select('*')
-      .eq('ip', ip)
-      .neq('user_id', discordUser.id);
-
-    if (ipRows && ipRows.length > 0) {
+    const ipRows = await sql`select * from verified_ips where ip = ${ip} and user_id != ${discordUser.id}`;
+    if (ipRows.length > 0) {
       console.warn(`Alt detected! IP ${ip} - ${discordUser.username} already used by ${ipRows[0].username}`);
       saveLog('alts', discordUser.id);
       return res.status(403).send(renderPage('banned',
@@ -500,11 +474,11 @@ app.get('/callback', async (req, res) => {
     console.log(`[Apple/iCloud] Skipping alt-IP check for ${ip} (${discordUser.username}) — relay: ${isRelay}, apple UA: ${isApple}`);
   }
 
-  await supabase.from('verified_ips').upsert({
-    ip,
-    user_id: discordUser.id,
-    username: discordUser.username,
-  });
+  await sql`
+    insert into verified_ips (user_id, username, ip)
+    values (${discordUser.id}, ${discordUser.username}, ${ip})
+    on conflict (user_id) do update set username = ${discordUser.username}, ip = ${ip}
+  `;
 
   console.log(`Verified: ${discordUser.username} (${discordUser.id}) from IP ${ip}`);
 
