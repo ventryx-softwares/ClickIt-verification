@@ -631,7 +631,7 @@ function renderPage(type, message) {
       z-index: 1;
       left: 7vw;
       bottom: 48px;
-      width: clamp(140px, 16vw, 220px);
+      width: clamp(200px, 22vw, 300px);
       mix-blend-mode: screen;
       opacity: 0.55;
       pointer-events: none;
