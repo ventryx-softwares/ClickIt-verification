@@ -416,7 +416,7 @@ app.get('/callback', async (req, res) => {
       console.warn(`[SECURITY] Blocked ${ip} — reason: ${threatResult.source} / ${threatResult.detail}`);
       saveLog(threatResult.logType, ip);
       return res.status(403).send(renderPage('vpn',
-        `Blocked. Reason: ${threatResult.detail}. Turn off your VPN or proxy and try again.`
+        `Reason: ${threatResult.detail}. Turn off your VPN or proxy and try again.`
       ));
     }
   }
@@ -502,7 +502,7 @@ app.get('/callback', async (req, res) => {
     console.error('Failed to update roles:', err.message);
   }
 
-  res.send(renderPage('success', `Verified, <strong>${discordUser.username}</strong>. Head back to the server.`));
+  res.send(renderPage('success', `<strong>${discordUser.username}</strong>, head back to the server.`));
 });
 
 app.get('/', (_, res) => res.send('ClickIt Verification Bot is running.'));
@@ -772,7 +772,6 @@ function renderPage(type, message) {
       <div class="rule"></div>
       <div class="footer">
         <span>ClickIt Verification by Ventryx</span>
-        <img src="${ICON}" alt="">
       </div>
     </div>
   </div>
