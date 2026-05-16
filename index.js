@@ -273,6 +273,8 @@ const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers]
 });
 
+client.on('error', (err) => console.error('[Discord] Client error:', err.message));
+
 async function registerCommands() {
   const commands = [
     new SlashCommandBuilder()
@@ -370,12 +372,17 @@ client.on('interactionCreate', async (interaction) => {
     reply += `**Datacenter Attempts:** ${dcAttempts}\n`;
     reply += `**Alt Attempts:** ${altAttempts}\n`;
 
-    return interaction.reply({ content: reply, ephemeral: true });
+    return interaction.reply({ content: reply, flags: 64 });
   }
 
   if (!interaction.isButton() || interaction.customId !== 'start_verify') return;
 
-  await interaction.deferReply({ ephemeral: true });
+  try {
+    await interaction.deferReply({ flags: 64 });
+  } catch (err) {
+    console.error('[Interaction] deferReply failed (token expired?):', err.message);
+    return;
+  }
 
   const existingRows = await sql`select user_id from verified_ips where user_id = ${interaction.user.id}`;
   if (existingRows.length > 0) {
