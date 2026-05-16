@@ -148,15 +148,6 @@ function checkProxyHeaders(headers) {
   for (const header of PROXY_HEADERS) {
     if (headers[header]) {
       if (header === 'x-forwarded-for') {
-        const ips = headers[header].split(',').map(s => s.trim());
-        if (ips.length > 1) {
-          return {
-            blocked: true,
-            source: 'headers',
-            detail: 'Multiple forwarded IPs indicate proxy chain',
-            logType: 'proxy',
-          };
-        }
         continue;
       }
       if (header === 'x-real-ip' && headers[header] !== headers['x-forwarded-for']) {
