@@ -526,6 +526,12 @@ function renderPage(type, message) {
   <style>
     @font-face {
       font-family: 'Geist Mono';
+      src: url('https://cdn.jsdelivr.net/npm/geist@1.3.1/dist/fonts/geist-mono/GeistMono-Thin.woff2') format('woff2');
+      font-weight: 100;
+      font-style: normal;
+    }
+    @font-face {
+      font-family: 'Geist Mono';
       src: url('https://cdn.jsdelivr.net/npm/geist@1.3.1/dist/fonts/geist-mono/GeistMono-Light.woff2') format('woff2');
       font-weight: 300;
       font-style: normal;
@@ -601,20 +607,19 @@ function renderPage(type, message) {
     .left {
       position: absolute;
       left: 7vw;
-      top: 50%;
-      transform: translateY(-50%);
+      top: 48px;
       z-index: 2;
     }
     .wordmark {
-      font-size: clamp(2.4rem, 5.5vw, 4.5rem);
-      font-weight: 300;
+      font-size: clamp(3rem, 7vw, 6rem);
+      font-weight: 100;
       letter-spacing: -0.02em;
       color: rgba(255,255,255,0.9);
       line-height: 1;
     }
     .sub {
       font-size: clamp(0.65rem, 1vw, 0.85rem);
-      font-weight: 300;
+      font-weight: 100;
       color: rgba(255,255,255,0.3);
       letter-spacing: 0.04em;
       margin-top: 10px;
@@ -624,12 +629,11 @@ function renderPage(type, message) {
     .icon-mark {
       position: absolute;
       z-index: 1;
-      right: calc(7vw + 420px + 60px);
-      top: 50%;
-      transform: translateY(-50%);
-      width: clamp(80px, 9vw, 130px);
+      left: 7vw;
+      bottom: 48px;
+      width: clamp(140px, 16vw, 220px);
       mix-blend-mode: screen;
-      opacity: 0.5;
+      opacity: 0.55;
       pointer-events: none;
     }
 
@@ -706,7 +710,7 @@ function renderPage(type, message) {
       z-index: 1;
       font-size: 0.8rem;
       font-weight: 300;
-      color: rgba(255,255,255,0.38);
+      color: rgba(255,255,255,0.72);
       line-height: 1.7;
     }
     p strong { color: rgba(255,255,255,0.75); font-weight: 400; }
@@ -726,7 +730,7 @@ function renderPage(type, message) {
       align-items: center;
       justify-content: space-between;
       font-size: 0.58rem;
-      color: rgba(255,255,255,0.15);
+      color: rgba(255,255,255,0.35);
       letter-spacing: 0.08em;
       text-transform: uppercase;
     }
