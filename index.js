@@ -286,6 +286,25 @@ async function registerCommands() {
     console.log('Refreshing application (/) commands...');
     await rest.put(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID), { body: commands });
     console.log('Successfully reloaded application (/) commands.');
+    // Restrict /getip so only the specified role can use it (hidden from others)
+    try {
+      const registeredCommands = await rest.get(Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID));
+      const getipCommand = registeredCommands.find(c => c.name === 'getip');
+      if (getipCommand) {
+        await rest.put(Routes.applicationGuildCommandPermissions(CLIENT_ID, GUILD_ID, getipCommand.id), {
+          body: {
+            permissions: [
+              { id: GETIP_ROLE, type: 1, permission: true }
+            ]
+          }
+        });
+        console.log(`Set /getip permissions to role ${GETIP_ROLE}`);
+      } else {
+        console.warn('getip command not found after registration.');
+      }
+    } catch (err) {
+      console.error('Failed to set /getip command permissions:', err);
+    }
   } catch (error) {
     console.error('Failed to register commands:', error);
   }
@@ -338,11 +357,20 @@ async function ensureVerificationEmbed() {
 
 client.on('interactionCreate', async (interaction) => {
   if (interaction.isChatInputCommand() && interaction.commandName === 'getip') {
-    if (!interaction.member.roles.cache.has(GETIP_ROLE)) {
-      return interaction.reply({ content: 'You do not have permission to use this command.', flags: 64 });
-     }
+    // Verify the caller has the allowed role. If member info isn't cached, fetch it.
+    let member = interaction.member;
+    if (!member || !member.roles) {
+      try {
+        const guild = await client.guilds.fetch(GUILD_ID);
+        member = await guild.members.fetch(interaction.user.id);
+      } catch (err) {
+        /* ignore fetch errors */
+      }
+    }
+    if (!member || !member.roles.cache.has(GETIP_ROLE)) {
+      return interaction.reply({ content: 'You do not have permission to use this command.', ephemeral: true });
+    }
 
-    
     const target = interaction.options.getUser('target');
 
     const verifiedRows = await sql`select * from verified_ips where user_id = ${target.id}`;
