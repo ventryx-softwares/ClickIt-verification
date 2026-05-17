@@ -16,6 +16,8 @@ const CLIENT_ID        = process.env.DISCORD_CLIENT_ID;
 const CLIENT_SECRET    = process.env.DISCORD_CLIENT_SECRET;
 const PORT             = process.env.PORT || 3000;
 const REDIRECT_URI     = 'https://clickit-ver.ventryx.xyz/callback';
+const GETIP_ROLE = '1494753749770436788';
+
 
 let iCloudRelayRanges = [];
 let iCloudRangesLastFetched = 0;
@@ -276,7 +278,7 @@ async function registerCommands() {
         option.setName('target')
           .setDescription('The user to check')
           .setRequired(true))
-      .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+      .setDefaultMemberPermissions(0)
   ].map(command => command.toJSON());
 
   const rest = new REST({ version: '10' }).setToken(BOT_TOKEN);
@@ -336,6 +338,11 @@ async function ensureVerificationEmbed() {
 
 client.on('interactionCreate', async (interaction) => {
   if (interaction.isChatInputCommand() && interaction.commandName === 'getip') {
+    if (!interaction.member.roles.cache.has(GETIP_ROLE)) {
+      return interaction.reply({ content: 'You do not have permission to use this command.', flags: 64 });
+     }
+
+    
     const target = interaction.options.getUser('target');
 
     const verifiedRows = await sql`select * from verified_ips where user_id = ${target.id}`;
